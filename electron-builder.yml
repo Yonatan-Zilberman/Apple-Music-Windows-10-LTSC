@@ -1,0 +1,26 @@
+appId: com.yonatan.apple-music-desktop
+productName: Apple Music Desktop
+directories:
+  output: release
+  buildResources: assets
+files:
+  - dist/**/*
+  - package.json
+extraResources:
+  - from: assets
+    to: assets
+electronDist: node_modules/electron/dist
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: assets/icon.ico
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Apple Music Desktop
+# VMP must run after Authenticode on Windows (CastLabs EVS requirement)
+afterSign: ./scripts/after-sign.cjs

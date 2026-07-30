@@ -1,0 +1,27 @@
+{
+  "name": "apple-music-desktop",
+  "version": "1.0.0",
+  "description": "Apple Music desktop shell for Windows 10 LTSC (CastLabs Electron + Widevine)",
+  "main": "dist/main/index.js",
+  "author": "Yonatan Zilberman",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "npm run build && electron .",
+    "pack": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder --win nsis",
+    "sign:vmp": "node scripts/sign-vmp.mjs",
+    "postinstall": "node node_modules/electron/install.js && node scripts/generate-icons.mjs"
+  },
+  "dependencies": {
+    "electron-store": "^8.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "electron": "https://github.com/castlabs/electron-releases#v42.5.2+wvcus",
+    "electron-builder": "^26.0.12",
+    "esbuild": "^0.25.5",
+    "typescript": "^5.8.3"
+  }
+}
