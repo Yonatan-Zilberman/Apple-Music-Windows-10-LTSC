@@ -1,7 +1,11 @@
 /**
  * Injected into music.apple.com after load.
- * Hooks MusicKit when available, with DOM / mediaSession fallbacks
- * so tray + media keys work even if MusicKit is late or hidden.
+ * Hooks MusicKit when available, with light DOM / mediaSession fallbacks.
+ *
+ * Performance rules:
+ * - Never observe the whole document; Apple's SPA mutates constantly.
+ * - Publish to the main process only when track/playing state actually changes.
+ * - Once MusicKit is attached, rely purely on its events (no polling).
  */
 (() => {
   interface PlaybackSnapshot {
@@ -58,11 +62,9 @@
   w.__amdInstalled = true;
 
   let musicKit: MusicKitInstance | null = null;
-  let lastProgressSent = 0;
-  let lastPublished = '';
-  let lastMediaMetadataKey = '';
+  let lastPublishedKey = '';
   let handlersBound = false;
-  let mutationTimer: ReturnType<typeof setTimeout> | null = null;
+  let fallbackTimer: number | null = null;
 
   function artworkUrl(raw: string | undefined | null): string | null {
     if (!raw) return null;
@@ -100,43 +102,26 @@
     const audio = document.querySelector('audio');
     const isPlaying = Boolean(audio && !audio.paused && !audio.ended);
 
-    // Prefer explicit now-playing chrome when present
     const chrome =
       document.querySelector<HTMLElement>('[data-testid="lcd-player"]') ||
       document.querySelector<HTMLElement>('.web-chrome') ||
-      document.querySelector<HTMLElement>('amp-lcd') ||
-      document.querySelector<HTMLElement>('[class*="lcd"]');
+      document.querySelector<HTMLElement>('amp-lcd');
 
     let title = '';
     let artist = '';
-    let album = '';
     let art: string | null = null;
 
     if (chrome) {
       const titleEl =
         chrome.querySelector<HTMLElement>('[data-testid="lcd-title"]') ||
-        chrome.querySelector<HTMLElement>('a[href*="/song/"]') ||
-        chrome.querySelector<HTMLElement>('[class*="title"]');
+        chrome.querySelector<HTMLElement>('a[href*="/song/"]');
       const artistEl =
         chrome.querySelector<HTMLElement>('[data-testid="lcd-artist"]') ||
-        chrome.querySelector<HTMLElement>('a[href*="/artist/"]') ||
-        chrome.querySelector<HTMLElement>('[class*="subtitle"]');
+        chrome.querySelector<HTMLElement>('a[href*="/artist/"]');
       const img = chrome.querySelector<HTMLImageElement>('img');
       title = (titleEl?.textContent || '').trim();
       artist = (artistEl?.textContent || '').trim();
       art = img?.currentSrc || img?.src || null;
-    }
-
-    if (!title) {
-      // Fallback: document title often "Song - Artist - Apple Music" or "Playlist - Apple Music"
-      const docTitle = document.title.replace(/\s*-\s*Apple Music\s*$/i, '').trim();
-      if (docTitle && !/playlist|album|station|radio/i.test(docTitle.split(' - ')[0] || '')) {
-        const parts = docTitle.split(' - ').map((p: string) => p.trim()).filter(Boolean);
-        if (parts.length >= 2) {
-          title = parts[0];
-          artist = parts[1];
-        }
-      }
     }
 
     if (!title && !artist && !art && !audio) return null;
@@ -144,7 +129,7 @@
     return {
       title,
       artist,
-      album,
+      album: '',
       artworkUrl: art,
       isPlaying,
       positionSec: audio ? Number(audio.currentTime) || 0 : 0,
@@ -186,39 +171,18 @@
   function syncMediaSession(state: PlaybackSnapshot): void {
     if (!('mediaSession' in navigator)) return;
     const ms = navigator.mediaSession;
-
-    const metaKey = `${state.title}|${state.artist}|${state.album}|${state.artworkUrl}`;
-    if (metaKey !== lastMediaMetadataKey) {
-      lastMediaMetadataKey = metaKey;
-      try {
-        const artwork = state.artworkUrl
-          ? [
-              { src: state.artworkUrl, sizes: '300x300', type: 'image/jpeg' },
-              { src: state.artworkUrl.replace('300x300', '600x600'), sizes: '600x600', type: 'image/jpeg' },
-            ]
-          : [];
-        ms.metadata = new MediaMetadata({
-          title: state.title || 'Apple Music',
-          artist: state.artist || 'Apple Music Desktop',
-          album: state.album || undefined,
-          artwork,
-        });
-      } catch {
-        // ignore MediaMetadata failures
-      }
-    }
-
     try {
+      ms.metadata = new MediaMetadata({
+        title: state.title || 'Apple Music',
+        artist: state.artist || 'Apple Music Desktop',
+        album: state.album || undefined,
+        artwork: state.artworkUrl
+          ? [{ src: state.artworkUrl, sizes: '300x300', type: 'image/jpeg' }]
+          : [],
+      });
       ms.playbackState = state.isPlaying ? 'playing' : 'paused';
-      if (state.durationSec > 0) {
-        ms.setPositionState({
-          duration: state.durationSec,
-          playbackRate: 1,
-          position: Math.min(state.positionSec, state.durationSec),
-        });
-      }
     } catch {
-      // ignore state failures
+      // ignore MediaMetadata failures
     }
 
     if (handlersBound) return;
@@ -226,11 +190,9 @@
 
     const bind = (action: MediaSessionAction, fn: () => void): void => {
       try {
-        ms.setActionHandler(action, () => {
-          fn();
-        });
+        ms.setActionHandler(action, fn);
       } catch {
-        // unsupported
+        // unsupported action
       }
     };
 
@@ -246,37 +208,29 @@
     bind('nexttrack', () => {
       void controls.next();
     });
-    bind('stop', () => {
-      void controls.pause();
-    });
   }
 
+  /**
+   * Send state to main only when something the UI actually shows changes.
+   * Position ticks are intentionally excluded — nothing displays them.
+   */
   function publish(force = false): void {
     const state = getState();
-    const key = JSON.stringify([
+    const key = [
       state.title,
       state.artist,
       state.album,
-      state.artworkUrl,
-      state.isPlaying,
-      Math.floor(state.positionSec),
-    ]);
-    if (!force && key === lastPublished) return;
-    lastPublished = key;
+      state.artworkUrl ?? '',
+      state.isPlaying ? '1' : '0',
+    ].join('\u0000');
+    if (!force && key === lastPublishedKey) return;
+    lastPublishedKey = key;
     try {
       w.amd?.sendPlaybackUpdate(state);
     } catch {
-      // ignore
+      // preload may not be ready in rare edge cases
     }
     syncMediaSession(state);
-  }
-
-  function debouncedPublish(): void {
-    if (mutationTimer) return;
-    mutationTimer = setTimeout(() => {
-      mutationTimer = null;
-      publish();
-    }, 250);
   }
 
   const controls = {
@@ -287,7 +241,7 @@
           publish(true);
           return;
         } catch {
-          // fall through
+          // fall through to DOM
         }
       }
       if (!clickAriaButton('play', 'play ')) {
@@ -303,7 +257,7 @@
           publish(true);
           return;
         } catch {
-          // fall through
+          // fall through to DOM
         }
       }
       if (!clickAriaButton('pause', 'pause ')) {
@@ -323,7 +277,7 @@
           publish(true);
           return;
         } catch {
-          // fall through
+          // fall through to DOM
         }
       }
       clickAriaButton('next', 'next ', 'skip to next');
@@ -336,7 +290,7 @@
           publish(true);
           return;
         } catch {
-          // fall through
+          // fall through to DOM
         }
       }
       clickAriaButton('previous', 'previous ', 'skip to previous');
@@ -347,25 +301,22 @@
 
   w.__amd = controls;
 
-  // DOM observer used only when MusicKit is unavailable
-  const observer = new MutationObserver(() => debouncedPublish());
+  function stopFallbackPolling(): void {
+    if (fallbackTimer !== null) {
+      window.clearInterval(fallbackTimer);
+      fallbackTimer = null;
+    }
+  }
 
   function attachMusicKit(music: MusicKitInstance): void {
     musicKit = music;
-    // Disconnect heavy DOM mutation observer once event-driven MusicKit is hooked!
-    observer.disconnect();
+    stopFallbackPolling();
 
-    const onChange = (): void => publish(true);
+    const onChange = (): void => publish();
     music.addEventListener('nowPlayingItemDidChange', onChange);
     music.addEventListener('playbackStateDidChange', onChange);
-    music.addEventListener('playbackTimeDidChange', () => {
-      const now = Date.now();
-      if (now - lastProgressSent < 1000) return;
-      lastProgressSent = now;
-      publish();
-    });
     publish(true);
-    console.log('[amd] MusicKit hook attached (DOM observer disconnected)');
+    console.log('[amd] MusicKit hook attached');
   }
 
   function tryAttachMusicKit(): boolean {
@@ -381,47 +332,29 @@
     }
   }
 
-  observer.observe(document.documentElement, {
-    subtree: true,
-    childList: true,
-    characterData: true,
-    attributes: true,
-    attributeFilter: ['aria-label', 'src', 'class'],
-  });
-  window.setInterval(() => {
-    if (!musicKit) publish();
-  }, 3000);
-
-  document.addEventListener(
-    'play',
-    () => {
-      handlersBound = false;
-      publish(true);
-    },
-    true,
-  );
-  document.addEventListener(
-    'pause',
-    () => {
-      handlersBound = false;
-      publish(true);
-    },
-    true,
-  );
+  // <audio> play/pause events are cheap and reliable — no DOM observer needed.
+  document.addEventListener('play', () => publish(), true);
+  document.addEventListener('pause', () => publish(), true);
 
   if (!tryAttachMusicKit()) {
     document.addEventListener('musickitloaded', () => {
       tryAttachMusicKit();
     });
+
+    // Low-frequency fallback keeps metadata fresh until MusicKit shows up,
+    // then attachMusicKit() stops it entirely.
     const started = Date.now();
-    const timer = window.setInterval(() => {
-      if (tryAttachMusicKit() || Date.now() - started > 120_000) {
-        window.clearInterval(timer);
+    fallbackTimer = window.setInterval(() => {
+      if (tryAttachMusicKit()) return;
+      publish();
+      if (Date.now() - started > 120_000 && fallbackTimer !== null) {
+        // Give up on MusicKit; keep a very light metadata refresh.
+        window.clearInterval(fallbackTimer);
+        fallbackTimer = window.setInterval(() => publish(), 5_000);
       }
-    }, 500);
+    }, 1_000);
   }
 
   publish(true);
   console.log('[amd] playback bridge ready');
 })();
-

@@ -57,11 +57,13 @@ export function createTray(): Tray {
     tray.popUpContextMenu(buildOverflowMenu());
   });
 
+  let lastTooltip = '';
   onPlaybackStateChange((state) => {
     if (!tray) return;
-    tray.setToolTip(tooltipFor(state));
-    if (!defaultIcon.isEmpty()) {
-      tray.setImage(defaultIcon);
+    const tooltip = tooltipFor(state);
+    if (tooltip !== lastTooltip) {
+      lastTooltip = tooltip;
+      tray.setToolTip(tooltip);
     }
   });
 

@@ -64,7 +64,7 @@ function ensureMiniWindow(): BrowserWindow {
 }
 
 function pushState(state: PlaybackState): void {
-  if (!miniWindow || miniWindow.isDestroyed()) return;
+  if (!miniWindow || miniWindow.isDestroyed() || !miniWindow.isVisible()) return;
   miniWindow.webContents.send(IPC.MINI_STATE, state);
 }
 
@@ -109,9 +109,10 @@ export function showMiniPlayer(trayBounds?: Electron.Rectangle): void {
   y = Math.min(Math.max(work.y + 8, y), work.y + work.height - height - 8);
 
   win.setPosition(x, y, false);
-  pushState(state);
   win.show();
   win.focus();
+  // Push after show() — pushState skips hidden windows.
+  pushState(state);
 }
 
 export function hideMiniPlayer(): void {
